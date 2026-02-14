@@ -1,30 +1,23 @@
 from fastapi import FastAPI
-from dotenv import load_dotenv
-from app.api.routes import router
 from contextlib import asynccontextmanager
-from sqlmodel import SQLModel, create_engine
-
-load_dotenv()
-
-# Database Setup 
-engine = create_engine(os.environ.get("DATABASE_URL"))
+from app.api import routes  
+from app.database import create_db_and_tables 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Create DB tables on startup
-    SQLModel.metadata.create_all(engine)
+    create_db_and_tables()
+    print("Startup: Database tables created.")
     yield
+    print("Shutdown: App is closing.")
 
 app = FastAPI(
     title="GlowFlow AI API",
-    description="Backend for BeautyVibe/GlowFlow App",
     version="1.0.0",
     lifespan=lifespan
 )
 
-# Include Routes
-app.include_router(router, prefix="/api/v1")
+app.include_router(routes.router, prefix="/api/v1")
 
 @app.get("/")
 def health_check():
-    return {"status": "GlowFlow Backend is Running"}
+    return {"status": "GlowFlow Backend is Running 🚀"}

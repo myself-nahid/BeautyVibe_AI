@@ -1,8 +1,11 @@
 import base64
 import json
+from dotenv import load_dotenv
 from openai import AsyncOpenAI
 from fastapi import HTTPException
 import os
+
+load_dotenv()
 
 client = AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
