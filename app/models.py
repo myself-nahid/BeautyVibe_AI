@@ -6,5 +6,5 @@ class UserProfile(SQLModel, table=True):
     user_id: str = Field(index=True) 
     skin_tone: str
     undertone: str
-    face_shape: Optional[str] = None
+    face_shape: str
     summary: str

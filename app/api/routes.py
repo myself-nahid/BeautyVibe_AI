@@ -20,6 +20,7 @@ async def analyze_skin(
         user_id="test_user_123", 
         skin_tone=ai_result["skin_tone"],
         undertone=ai_result["undertone"],
+        face_shape=ai_result["face_shape"],
         summary=ai_result["summary"]
     )
     db.add(new_profile)
