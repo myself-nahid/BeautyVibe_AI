@@ -1,126 +1,258 @@
+"""
+app/services/ai_service.py
+──────────────────────────
+All interactions with the OpenAI API live here.
+
+Design principles
+─────────────────
+• One AsyncOpenAI client shared across the process lifetime (created once,
+  reused everywhere) — avoids per-request connection overhead.
+• Image bytes are validated (type + size) before hitting the API.
+• Both functions raise typed HTTPExceptions on failure; callers do not need
+  to handle raw OpenAI exceptions.
+• A safe fallback is returned from analyze_face_image() if the AI call fails,
+  so a broken API key never takes the whole endpoint down.
+"""
+
 import base64
 import json
-import os
-from openai import AsyncOpenAI
-from fastapi import HTTPException
-from dotenv import load_dotenv
+import logging
+from typing import Any
 
-load_dotenv()
+from fastapi import HTTPException, status
+from openai import AsyncOpenAI, OpenAIError
 
-api_key = os.getenv("OPENAI_API_KEY")
-if not api_key:
-    print("CRITICAL ERROR: OPENAI_API_KEY is missing in .env file!")
+from app.core.config import get_settings
+# from app.core.exceptions import AIServiceError
+from app.core.config import Settings
+from app.core.exceptions import AIServiceError
+from app.schemas import MatchResult, ProductShade, SkinAnalysisResult
 
-client = AsyncOpenAI(api_key=api_key)
+logger = logging.getLogger(__name__)
+settings = get_settings()
 
-async def analyze_face_image(image_bytes: bytes):
-    base64_image = base64.b64encode(image_bytes).decode('utf-8')
+_client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
 
-    prompt = """
-    You are a beauty consultant. Analyze this face.
-    
-    REQUIRED JSON OUTPUT FIELDS:
-    1. skin_tone: [Fair, Light, Medium, Tan, Deep]
-    2. undertone: [Cool, Neutral, Warm]
-    3. face_shape: [Oval, Round, Square, Heart, Diamond, Oblong] (Pick the closest match, do not return null)
-    4. eye_color: String
-    5. summary: A short sentence describing the features.
-    
-    Return strictly valid JSON.
+_MIME_TO_PREFIX: dict[str, str] = {
+    "image/jpeg": "data:image/jpeg;base64,",
+    "image/jpg":  "data:image/jpeg;base64,",
+    "image/png":  "data:image/png;base64,",
+    "image/webp": "data:image/webp;base64,",
+}
+
+_FALLBACK_ANALYSIS: dict[str, Any] = {
+    "skin_tone": "Medium",
+    "undertone": "Neutral",
+    "face_shape": "Oval",
+    "eye_color": "Unknown",
+    "confidence_score": 0,
+    "summary": "Analysis unavailable — please try again.",
+}
+
+
+def _detect_mime(image_bytes: bytes) -> str:
     """
+    Detect image MIME type from magic bytes.
+    Returns a string like 'image/jpeg'.
+    """
+    if image_bytes[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if image_bytes[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if image_bytes[:4] in (b"RIFF", b"WEBP") or b"WEBP" in image_bytes[:12]:
+        return "image/webp"
+    return "application/octet-stream"
 
-    try:
-        response = await client.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {"role": "system", "content": "You are a beauty AI. Output JSON only."},
-                {"role": "user", "content": [
-                    {"type": "text", "text": prompt},
-                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}
-                ]}
-            ],
-            response_format={"type": "json_object"},
-            max_tokens=300
+
+def _validate_image(image_bytes: bytes) -> str:
+    """
+    Validate image size and type.
+    Returns the detected MIME type on success.
+    Raises HTTPException on failure.
+    """
+    if len(image_bytes) > settings.max_image_bytes:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"Image exceeds the {settings.MAX_IMAGE_SIZE_MB} MB limit.",
         )
 
-        content = response.choices[0].message.content
-        result = json.loads(content)
+    mime = _detect_mime(image_bytes)
+    if mime not in _MIME_TO_PREFIX:
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail=f"Unsupported image type '{mime}'. Accepted: JPEG, PNG, WebP.",
+        )
+    return mime
 
-        if result.get("face_shape") is None:
-            summary_text = result.get("summary", "").lower()
-            
-            if "oval" in summary_text:
-                result["face_shape"] = "Oval"
-            elif "round" in summary_text:
-                result["face_shape"] = "Round"
-            elif "square" in summary_text:
-                result["face_shape"] = "Square"
-            elif "heart" in summary_text:
-                result["face_shape"] = "Heart"
-            elif "diamond" in summary_text:
-                result["face_shape"] = "Diamond"
-            elif "oblong" in summary_text:
-                result["face_shape"] = "Oblong"
-            else:
-                result["face_shape"] = "Oval" 
-        
-        result["face_shape"] = result["face_shape"].capitalize()
 
+def _resolve_face_shape(result: dict[str, Any]) -> str:
+    """
+    Return a valid face-shape string.
+    Falls back to parsing the summary if the AI omitted the field.
+    """
+    shape = (result.get("face_shape") or "").strip().title()
+    valid = {"Oval", "Round", "Square", "Heart", "Diamond", "Oblong"}
+
+    if shape in valid:
+        return shape
+
+    # Secondary: scan the summary text
+    summary = (result.get("summary") or "").lower()
+    for candidate in ("oval", "round", "square", "heart", "diamond", "oblong"):
+        if candidate in summary:
+            return candidate.title()
+
+    return "Oval"  # final safe default
+
+async def analyze_face_image(image_bytes: bytes) -> dict[str, Any]:
+    """
+    Analyse a face image using GPT-4o vision.
+
+    Returns a dict with keys:
+        skin_tone, undertone, face_shape, eye_color,
+        confidence_score, summary
+
+    Never raises — returns _FALLBACK_ANALYSIS on any error so that
+    the endpoint stays alive even if the AI call fails.
+    """
+    mime = _validate_image(image_bytes)   # may raise HTTPException
+    data_url = _MIME_TO_PREFIX[mime] + base64.b64encode(image_bytes).decode()
+
+    prompt = (
+        "You are a professional beauty consultant with expertise in skin analysis.\n\n"
+        "Carefully analyse the face in this image and return ONLY a JSON object "
+        "with these exact keys:\n"
+        "  skin_tone        : one of [Fair, Light, Medium, Tan, Deep]\n"
+        "  undertone        : one of [Cool, Neutral, Warm]\n"
+        "  face_shape       : one of [Oval, Round, Square, Heart, Diamond, Oblong]\n"
+        "  eye_color        : descriptive string (e.g. 'Dark Brown', 'Hazel')\n"
+        "  confidence_score : integer 0-100 representing your confidence\n"
+        "  summary          : one sentence describing the person's key features\n\n"
+        "Rules:\n"
+        "- Return ONLY valid JSON — no markdown, no explanation.\n"
+        "- Never set any field to null; always choose the closest match.\n"
+        "- confidence_score must reflect how clearly the features are visible."
+    )
+
+    try:
+        response = await _client.chat.completions.create(
+            model=settings.OPENAI_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a beauty AI analyst. Output JSON only.",
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": data_url}},
+                    ],
+                },
+            ],
+            response_format={"type": "json_object"},
+            max_tokens=400,
+            temperature=0.2,   # low temperature for consistent classifications
+        )
+
+        raw = response.choices[0].message.content
+        result: dict[str, Any] = json.loads(raw)
+
+        # Sanitise fields
+        result["face_shape"] = _resolve_face_shape(result)
+        result["confidence_score"] = max(0, min(100, int(result.get("confidence_score", 0))))
+        result.setdefault("eye_color", "Unknown")
+        result.setdefault("summary", "")
+
+        logger.info(
+            "Face analysis complete — tone=%s undertone=%s confidence=%s",
+            result.get("skin_tone"),
+            result.get("undertone"),
+            result.get("confidence_score"),
+        )
         return result
 
-    except Exception as e:
-        print(f"AI ERROR: {str(e)}")
-        return {
-            "skin_tone": "Medium",
-            "undertone": "Neutral",
-            "face_shape": "Oval",
-            "eye_color": "Brown",
-            "confidence_score": 0,
-            "summary": f"Error: {str(e)}"
-        }
+    except (OpenAIError, json.JSONDecodeError, KeyError, ValueError) as exc:
+        logger.error("analyze_face_image error: %s", exc)
+        fallback = dict(_FALLBACK_ANALYSIS)
+        fallback["summary"] = f"Analysis error: {exc}"
+        return fallback
 
-async def get_shade_recommendation(profile, products):
+
+async def get_shade_recommendation(
+    profile: SkinAnalysisResult,
+    products: list[ProductShade],
+) -> MatchResult:
     """
-    Matches the user profile against a list of products using AI logic.
+    Use GPT-4o to select the single best-matching product shade
+    for the given beauty profile.
+
+    Raises AIServiceError (HTTP 502) if the API call fails.
     """
-    
-    products_json = json.dumps([p.dict() for p in products])
-    
-    prompt = f"""
-    Act as a Professional Color Theorist and Makeup Artist.
-    
-    **User Profile:**
-    - Skin Tone: {profile.skin_tone}
-    - Undertone: {profile.undertone}
-    - Eye Color: {profile.eye_color}
-    
-    **Available Products:**
-    {products_json}
-    
-    **Task:**
-    Select the SINGLE best matching product from the list that complements the user's skin tone and undertone.
-    
-    **Return strictly valid JSON:**
-    {{
-        "best_match_id": "product_id_from_list",
-        "match_score": integer (0-100),
-        "reasoning": "A short explanation of why this shade works best."
-    }}
-    """
+    products_payload = [p.model_dump() for p in products]
+
+    prompt = (
+        "You are a Professional Color Theorist and Makeup Artist.\n\n"
+        f"User Beauty Profile:\n"
+        f"  Skin Tone : {profile.skin_tone}\n"
+        f"  Undertone : {profile.undertone}\n"
+        f"  Eye Color : {profile.eye_color}\n\n"
+        "Available Products (JSON array):\n"
+        f"{json.dumps(products_payload, indent=2)}\n\n"
+        "Task:\n"
+        "Select the SINGLE product from the list that best complements the "
+        "user's skin tone and undertone based on colour theory.\n\n"
+        "Return ONLY a JSON object with these exact keys:\n"
+        "  best_match_id : the 'id' string of the chosen product\n"
+        "  match_score   : integer 0-100 (100 = perfect match)\n"
+        "  reasoning     : 1-2 sentences explaining the colour-theory rationale\n\n"
+        "Rules:\n"
+        "- Return ONLY valid JSON — no markdown, no extra text.\n"
+        "- best_match_id MUST be one of the ids in the product list."
+    )
 
     try:
-        response = await client.chat.completions.create(
-            model="gpt-4o",
+        response = await _client.chat.completions.create(
+            model=settings.OPENAI_MODEL,
             messages=[
-                {"role": "system", "content": "You are a color match expert. Output JSON only."},
-                {"role": "user", "content": prompt}
+                {
+                    "role": "system",
+                    "content": "You are a colour match expert. Output JSON only.",
+                },
+                {"role": "user", "content": prompt},
             ],
             response_format={"type": "json_object"},
-            max_tokens=300
+            max_tokens=300,
+            temperature=0.2,
         )
-        
-        return json.loads(response.choices[0].message.content)
 
-    except Exception as e:
-        print(f"RECOMMENDATION API ERROR: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Recommendation Failed: {str(e)}")
+        data: dict[str, Any] = json.loads(response.choices[0].message.content)
+
+        # Validate the returned id actually exists in the supplied product list
+        valid_ids = {p.id for p in products}
+        if data.get("best_match_id") not in valid_ids:
+            logger.warning(
+                "AI returned unknown product id '%s'. Defaulting to first product.",
+                data.get("best_match_id"),
+            )
+            data["best_match_id"] = products[0].id
+
+        # Attach the full matched product details
+        matched = next((p for p in products if p.id == data["best_match_id"]), None)
+
+        logger.info(
+            "Shade recommendation: id=%s score=%s",
+            data["best_match_id"],
+            data.get("match_score"),
+        )
+
+        return MatchResult(
+            best_match_id=data["best_match_id"],
+            match_score=max(0, min(100, int(data.get("match_score", 0)))),
+            reasoning=data.get("reasoning", ""),
+            matched_product=matched,
+        )
+
+    except (OpenAIError, json.JSONDecodeError, KeyError, ValueError) as exc:
+        logger.error("get_shade_recommendation error: %s", exc)
+        raise AIServiceError(f"Recommendation failed: {exc}") from exc

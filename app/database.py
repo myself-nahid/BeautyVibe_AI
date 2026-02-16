@@ -1,17 +1,42 @@
-from sqlmodel import SQLModel, create_engine, Session
-import os
-from dotenv import load_dotenv
+"""
+app/database.py
+───────────────
+Database engine + session factory using SQLModel.
 
-load_dotenv()
+• Engine is created once at import time from Settings.
+• get_session() is a FastAPI dependency that yields a managed
+  session (auto-commit / rollback on error, always closed).
+• create_db_and_tables() is called from the lifespan hook in main.py.
+"""
 
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./glowflow.db")
+from collections.abc import Generator
 
-connect_args = {"check_same_thread": False} if "sqlite" in DATABASE_URL else {}
-engine = create_engine(DATABASE_URL, echo=True, connect_args=connect_args)
+from sqlmodel import Session, SQLModel, create_engine
 
-def create_db_and_tables():
+from app.core.config import get_settings
+
+settings = get_settings()
+
+# SQLite needs check_same_thread=False; other drivers do not.
+_connect_args = {"check_same_thread": False} if settings.is_sqlite else {}
+
+engine = create_engine(
+    settings.DATABASE_URL,
+    echo=settings.APP_DEBUG,       # SQL logging only in debug mode
+    connect_args=_connect_args,
+)
+
+
+def create_db_and_tables() -> None:
+    """Create all tables declared in SQLModel models."""
     SQLModel.metadata.create_all(engine)
 
-def get_session():
+
+def get_session() -> Generator[Session, None, None]:
+    """
+    FastAPI dependency — yields a database session.
+    The 'with' block ensures the session is always closed and any
+    uncommitted transaction is rolled back on exception.
+    """
     with Session(engine) as session:
         yield session
