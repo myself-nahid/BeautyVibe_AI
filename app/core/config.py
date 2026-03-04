@@ -30,6 +30,8 @@ class Settings(BaseSettings):
     OPENAI_API_KEY: str
     OPENAI_MODEL: str = "gpt-4o"
 
+    AI_SERVICE_SECRET: str = "glowflow-internal-secret-key-12345" 
+
     MAX_IMAGE_SIZE_MB: int = 5
     ALLOWED_IMAGE_TYPES: List[str] = ["image/jpeg", "image/png", "image/webp"]
 
