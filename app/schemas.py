@@ -91,7 +91,7 @@ class ProductShade(BaseModel):
     shade:               Optional[str]   = Field(default=None, examples=["Crystal Pink"])
     price:               Optional[float] = Field(default=None, examples=[399.00])
     discount_percentage: Optional[int]   = Field(default=0,    examples=[20])
-    rating:              Optional[str]   = Field(default=None, examples=["4.5"])
+    rating:              Optional[float]   = Field(default=None, examples=["4.5"])
     image:               Optional[str]   = Field(default=None)
     description:         Optional[str]   = Field(default=None)
     hex_code:            Optional[str]   = Field(default=None)
@@ -141,8 +141,10 @@ class MatchedProduct(BaseModel):
     shade:               Optional[str]   = None
     price:               Optional[float] = None
     discount_percentage: Optional[int]   = None
-    rating:              Optional[str]   = None
+    rating:              Optional[float] = None
     image:               Optional[str]   = None
+    category:            Optional[str]   = None
+    hex_code:            Optional[str]   = None
 
     @classmethod
     def from_product_shade(cls, p: ProductShade) -> "MatchedProduct":
@@ -156,6 +158,8 @@ class MatchedProduct(BaseModel):
             discount_percentage=p.discount_percentage,
             rating=p.rating,
             image=p.image,
+            category=p.category,
+            hex_code=p.hex_code,
         )
 
 
