@@ -2,13 +2,6 @@
 app/services/ai_service.py
 ──────────────────────────
 All interactions with the OpenAI API live here.
-
-Design principles
-─────────────────
-• One AsyncOpenAI client shared across the process lifetime.
-• Image bytes are validated (type + size) before hitting the API.
-• analyze_face_image() never raises — returns a safe fallback on error.
-• get_shade_recommendations() raises AIServiceError (HTTP 502) on failure.
 """
 
 import base64
@@ -21,7 +14,14 @@ from openai import AsyncOpenAI, OpenAIError
 
 from app.core.config import get_settings
 from app.core.exceptions import AIServiceError
-from app.schemas import MatchResult, ProductShade, RecommendationResponse, SkinAnalysisResult
+from app.schemas import (
+    Category,
+    MatchedProduct,
+    MatchResult,
+    ProductShade,
+    RecommendationResponse,
+    SkinAnalysisResult,
+)
 
 logger   = logging.getLogger(__name__)
 settings = get_settings()
@@ -86,23 +86,15 @@ def _resolve_face_shape(result: dict[str, Any]) -> str:
     return "Oval"
 
 
-# ─────────────────────────────────────────────
-# Product payload builder
-# ─────────────────────────────────────────────
-
 def _build_product_payload(products: list[ProductShade]) -> list[dict]:
-    """
-    Serialize only the fields relevant to colour-theory matching.
-    Omits None values to keep the prompt concise.
-    """
+    """Slim product list for the AI prompt — colour-relevant fields only."""
     payload = []
     for p in products:
         entry: dict[str, Any] = {"id": p.id, "name": p.name}
-        if p.brand:               entry["brand"]    = p.brand
-        if p.shade:               entry["shade"]    = p.shade
-        if p.hex_code:            entry["hex_code"] = p.hex_code
-        if p.category:            entry["category"] = p.category
-        if p.description:         entry["description"] = p.description
+        if p.shade:    entry["shade"]    = p.shade
+        if p.hex_code: entry["hex_code"] = p.hex_code
+        if p.brand:    entry["brand"]    = p.brand
+        if p.category: entry["category"] = p.category
         payload.append(entry)
     return payload
 
@@ -114,13 +106,7 @@ def _build_product_payload(products: list[ProductShade]) -> list[dict]:
 async def analyze_face_image(image_bytes: bytes) -> dict[str, Any]:
     """
     Analyse a face image using GPT-4o vision.
-
-    Returns a dict with keys:
-        skin_tone, undertone, face_shape, eye_color,
-        confidence_score, summary
-
-    Never raises — returns _FALLBACK_ANALYSIS on any AI error so the
-    endpoint stays alive even when the OpenAI call fails.
+    Never raises — returns _FALLBACK_ANALYSIS on any error.
     """
     mime     = _validate_image(image_bytes)
     data_url = _MIME_TO_PREFIX[mime] + base64.b64encode(image_bytes).decode()
@@ -169,9 +155,7 @@ async def analyze_face_image(image_bytes: bytes) -> dict[str, Any]:
 
         logger.info(
             "Face analysis complete — tone=%s undertone=%s confidence=%s",
-            result.get("skin_tone"),
-            result.get("undertone"),
-            result.get("confidence_score"),
+            result.get("skin_tone"), result.get("undertone"), result.get("confidence_score"),
         )
         return result
 
@@ -187,20 +171,22 @@ async def analyze_face_image(image_bytes: bytes) -> dict[str, Any]:
 # ─────────────────────────────────────────────
 
 async def get_shade_recommendations(
-    profile:  SkinAnalysisResult,
-    products: list[ProductShade],
-    top_n:    int = 3,
+    profile:    SkinAnalysisResult,
+    products:   list[ProductShade],
+    categories: list[Category],
+    top_n:      int = 3,
 ) -> RecommendationResponse:
     """
-    Use GPT-4o to return the top-N best-matching product shades ranked
-    by colour theory for the given beauty profile.
+    Use GPT-4o to return top-N ranked shade recommendations.
 
-    `products` should already have their `category` field resolved
-    (call request.products_with_category() before passing in).
+    - categories are passed through to the response as a separate list.
+    - matched_product is built from the original input product only —
+      the AI never reconstructs product data.
 
-    Raises AIServiceError (HTTP 502) if the API call fails.
+    Raises AIServiceError (HTTP 502) on failure.
     """
     actual_top_n     = min(top_n, len(products))
+    product_map      = {p.id: p for p in products}
     products_payload = _build_product_payload(products)
 
     prompt = (
@@ -209,26 +195,22 @@ async def get_shade_recommendations(
         f"  Skin Tone : {profile.skin_tone}\n"
         f"  Undertone : {profile.undertone}\n"
         f"  Eye Color : {profile.eye_color}\n\n"
-        "## Available Products (JSON array)\n"
+        "## Available Products\n"
         f"{json.dumps(products_payload, indent=2)}\n\n"
         "## Task\n"
         f"Select the TOP {actual_top_n} products that best complement the user's "
-        "skin tone and undertone based on colour theory. "
-        "Rank them from best match to worst.\n\n"
-        "Colour-theory principles to apply:\n"
-        "- Warm undertones (golden/peachy/yellow hues) → earthy, warm, terracotta, "
-        "  coral, bronze, warm nude shades work best.\n"
-        "- Cool undertones (pink/red/blue hues) → berry, mauve, rose, cool nude, "
-        "  burgundy shades work best.\n"
-        "- Neutral undertones → most shades work; slight preference for balanced nudes.\n"
-        "- Deep skin tones → richer, highly pigmented shades show up best.\n"
-        "- Use the shade name and hex_code (when available) as the primary colour signal.\n\n"
-        "## Output Format\n"
-        "Return ONLY a valid JSON object — no markdown, no extra text:\n"
+        "skin tone and undertone. Rank from best match to worst.\n\n"
+        "Colour-theory rules:\n"
+        "- Warm undertones → earthy, coral, terracotta, bronze, warm nude shades.\n"
+        "- Cool undertones → berry, mauve, rose, burgundy, cool nude shades.\n"
+        "- Neutral undertones → most shades work; prefer balanced nudes.\n"
+        "- Deep skin tones → rich, highly pigmented shades show up best.\n"
+        "- Use shade name and hex_code as the primary colour signal.\n\n"
+        "## Output — return ONLY this JSON, no markdown:\n"
         "{\n"
         '  "matches": [\n'
         "    {\n"
-        '      "best_match_id": "<id string>",\n'
+        '      "best_match_id": "<id string exactly as given>",\n'
         '      "match_score":   <integer 0-100>,\n'
         '      "reasoning":     "<1-2 sentences citing shade name and colour theory>"\n'
         "    }\n"
@@ -237,7 +219,7 @@ async def get_shade_recommendations(
         "Rules:\n"
         "- best_match_id MUST exactly match one of the id values above.\n"
         "- No duplicate ids.\n"
-        f"- The matches array must contain exactly {actual_top_n} entries."
+        f"- matches array must have exactly {actual_top_n} entries."
     )
 
     try:
@@ -255,14 +237,12 @@ async def get_shade_recommendations(
         data: dict[str, Any] = json.loads(response.choices[0].message.content)
         matches_raw: list[dict] = data.get("matches", [])
 
-        product_map = {p.id: p for p in products}
-        valid_ids   = set(product_map.keys())
-        seen_ids:  set[str]       = set()
-        results:   list[MatchResult] = []
+        valid_ids = set(product_map.keys())
+        seen_ids: set[str]          = set()
+        results:  list[MatchResult] = []
 
         for item in matches_raw:
-            # Normalise to str — AI may echo the id back as an integer
-            match_id = str(item.get("best_match_id", ""))
+            match_id = str(item.get("best_match_id", "")).strip()
 
             if match_id not in valid_ids:
                 logger.warning("AI returned unknown product id '%s'. Skipping.", match_id)
@@ -272,23 +252,21 @@ async def get_shade_recommendations(
                 continue
 
             seen_ids.add(match_id)
+            original = product_map[match_id]
+
             results.append(
                 MatchResult(
                     best_match_id=match_id,
                     match_score=max(0, min(100, int(item.get("match_score", 0)))),
                     reasoning=item.get("reasoning", ""),
-                    matched_product=product_map[match_id],
+                    # ✅ Built from original input — no AI reconstruction
+                    matched_product=MatchedProduct.from_product_shade(original),
                 )
             )
 
-        # ── Fallback padding ─────────────────────────────────────────────
-        # Pad with remaining products at score=0 so callers always get
-        # exactly actual_top_n entries even when the AI returns too few.
+        # Pad if AI returned fewer than requested
         if len(results) < actual_top_n:
-            logger.warning(
-                "AI returned %d/%d matches — padding with remaining products.",
-                len(results), actual_top_n,
-            )
+            logger.warning("AI returned %d/%d — padding.", len(results), actual_top_n)
             for product in products:
                 if product.id not in seen_ids:
                     results.append(
@@ -296,7 +274,7 @@ async def get_shade_recommendations(
                             best_match_id=product.id,
                             match_score=0,
                             reasoning="Fallback entry — insufficient AI results.",
-                            matched_product=product,
+                            matched_product=MatchedProduct.from_product_shade(product),
                         )
                     )
                     seen_ids.add(product.id)
@@ -304,12 +282,16 @@ async def get_shade_recommendations(
                         break
 
         final = results[:actual_top_n]
-
         logger.info(
-            "Shade recommendations complete — returned=%d profile=%s/%s",
+            "Recommendations done — returned=%d profile=%s/%s",
             len(final), profile.skin_tone, profile.undertone,
         )
-        return RecommendationResponse(recommendations=final, total=len(final))
+
+        return RecommendationResponse(
+            categories=categories,          # ✅ separate — never inside matched_product
+            recommendations=final,
+            total=len(final),
+        )
 
     except (OpenAIError, json.JSONDecodeError, KeyError, ValueError) as exc:
         logger.error("get_shade_recommendations error: %s", exc)

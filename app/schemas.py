@@ -2,9 +2,6 @@
 app/schemas.py
 ──────────────
 Pydantic v2 request / response schemas (DTOs).
-
-Kept separate from SQLModel table models so that the API contract
-can evolve independently of the persistence layer.
 """
 
 from datetime import datetime
@@ -22,8 +19,6 @@ FACE_SHAPES = {"Oval", "Round", "Square", "Heart", "Diamond", "Oblong"}
 # ─────────────────────────────────────────────
 
 class SkinAnalysisResult(BaseModel):
-    """Response schema for the /analyze endpoint."""
-
     skin_tone:        str = Field(examples=["Medium"])
     undertone:        str = Field(examples=["Warm"])
     face_shape:       str = Field(examples=["Oval"])
@@ -51,8 +46,6 @@ class SkinAnalysisResult(BaseModel):
 
 
 class UserProfileResponse(BaseModel):
-    """Public representation of a saved UserProfile row."""
-
     id:               int
     user_id:          str
     skin_tone:        str
@@ -67,14 +60,11 @@ class UserProfileResponse(BaseModel):
 
 
 # ─────────────────────────────────────────────
-# Category  (matches backend categories array)
+# Category
 # ─────────────────────────────────────────────
 
 class Category(BaseModel):
-    """
-    One entry from the backend's `categories` array.
-    Matches the exact shape sent by the Main Backend.
-    """
+    """Matches the exact shape in the backend's categories array."""
     id:         int
     name:       str
     slug:       str
@@ -83,43 +73,39 @@ class Category(BaseModel):
 
 
 # ─────────────────────────────────────────────
-# Product  (matches backend products array)
+# Product  (input — from backend payload)
 # ─────────────────────────────────────────────
 
 class ProductShade(BaseModel):
     """
-    One product entry from the Main Backend's products array.
+    Matches the EXACT product object shape from the backend payload.
 
-    • id               – sent as int by backend, coerced to str internally
-    • price            – sent as string ("399.00"), coerced to float
-    • category         – NOT in the product object; resolved from the
-                         categories array by RecommendationRequest and
-                         injected here before AI processing.
+    Coercions:
+      • id    : int  → str
+      • price : str  → float
     """
-    id:                  str            = Field(examples=["16"])
-    name:                str            = Field(examples=["Velvet Matte Lipstick"])
-    slug:                Optional[str]  = Field(default=None)
-    brand:               Optional[str]  = Field(default=None, examples=["VELYVA"])
-    shade:               Optional[str]  = Field(default=None, examples=["Crystal Pink"])
-    price:               Optional[float]= Field(default=None, examples=[399.00])
-    discount_percentage: Optional[int]  = Field(default=0,    examples=[20])
-    rating:              Optional[str]  = Field(default=None, examples=["4.5"])
-    image:               Optional[str]  = Field(default=None)
-    description:         Optional[str]  = Field(default=None)
-    hex_code:            Optional[str]  = Field(default=None, examples=["#FFDAB9"])
-    # Injected from the categories array — not present in raw product objects
-    category:            Optional[str]  = Field(default=None, examples=["Lipstick"])
+    id:                  str             = Field(examples=["16"])
+    name:                str             = Field(examples=["Velvet Matte Lipstick"])
+    slug:                Optional[str]   = Field(default=None)
+    brand:               Optional[str]   = Field(default=None, examples=["VELYVA"])
+    shade:               Optional[str]   = Field(default=None, examples=["Crystal Pink"])
+    price:               Optional[float] = Field(default=None, examples=[399.00])
+    discount_percentage: Optional[int]   = Field(default=0,    examples=[20])
+    rating:              Optional[str]   = Field(default=None, examples=["4.5"])
+    image:               Optional[str]   = Field(default=None)
+    description:         Optional[str]   = Field(default=None)
+    hex_code:            Optional[str]   = Field(default=None)
+    # Resolved internally — never in raw product objects
+    category:            Optional[str]   = Field(default=None)
 
     @field_validator("id", mode="before")
     @classmethod
     def coerce_id_to_str(cls, v) -> str:
-        """Backend sends id as integer — normalise to string."""
         return str(v)
 
     @field_validator("price", mode="before")
     @classmethod
     def coerce_price_to_float(cls, v) -> Optional[float]:
-        """Backend sends price as string e.g. '399.00' — normalise to float."""
         if v is None:
             return None
         try:
@@ -134,70 +120,155 @@ class ProductShade(BaseModel):
             return None
         v = v.strip()
         if not v.startswith("#") or len(v) not in (4, 7):
-            raise ValueError(f"'{v}' is not a valid hex colour code (e.g. #FFDAB9).")
+            raise ValueError(f"'{v}' is not a valid hex colour code.")
         return v.upper()
 
 
 # ─────────────────────────────────────────────
-# Recommendation request  (full explore payload)
+# Matched product  (output — clean response shape)
 # ─────────────────────────────────────────────
+
+class MatchedProduct(BaseModel):
+    """
+    Product fields returned inside each recommendation.
+    Mirrors the exact fields from the backend's products array.
+    No internal fields (category, hex_code, description).
+    """
+    id:                  str
+    name:                str
+    slug:                Optional[str]   = None
+    brand:               Optional[str]   = None
+    shade:               Optional[str]   = None
+    price:               Optional[float] = None
+    discount_percentage: Optional[int]   = None
+    rating:              Optional[str]   = None
+    image:               Optional[str]   = None
+
+    @classmethod
+    def from_product_shade(cls, p: ProductShade) -> "MatchedProduct":
+        return cls(
+            id=p.id,
+            name=p.name,
+            slug=p.slug,
+            brand=p.brand,
+            shade=p.shade,
+            price=p.price,
+            discount_percentage=p.discount_percentage,
+            rating=p.rating,
+            image=p.image,
+        )
+
+
+# ─────────────────────────────────────────────
+# Recommendation request
+# ─────────────────────────────────────────────
+
+class ExploreData(BaseModel):
+    """The inner `data` object of the Main Backend's explore response."""
+    user_id:        Optional[str]      = None
+    user_profile:   SkinAnalysisResult
+    categories:     List[Category]     = Field(default_factory=list)
+    products:       List[ProductShade] = Field(min_length=1)
+    total_products: Optional[int]      = None
+    page:           Optional[int]      = None
+    total_pages:    Optional[int]      = None
+    next:           Optional[str]      = None
+    previous:       Optional[str]      = None
+
 
 class RecommendationRequest(BaseModel):
     """
-    Accepts the EXACT explore-page payload shape sent by the Main Backend:
+    Accepts the full backend payload in either shape:
 
-        {
-          "user_id": "...",
-          "user_profile": { ... },
-          "categories": [ { "id": 1, "name": "Lipstick", "slug": "lipstick", ... } ],
-          "products": [ { "id": 16, "name": "...", "shade": "...", ... } ],
-          "top_n": 3          ← optional, default 3
-        }
+    Shape 1 — Full envelope:
+      { "success": true, "status": 200, "message": "...", "top_n": 3, "data": { ... } }
 
-    products_with_category() resolves the missing category field on each
-    product by matching category names against the product name.
+    Shape 2 — Flat (inner data directly):
+      { "user_profile": {...}, "categories": [...], "products": [...], "top_n": 3 }
     """
+    # Outer envelope
+    success: Optional[bool]        = None
+    status:  Optional[int]         = None
+    message: Optional[str]         = None
+    data:    Optional[ExploreData] = None
 
-    user_id:      Optional[str]      = Field(default=None, examples=["user_abc123"])
-    user_profile: SkinAnalysisResult
-    categories:   List[Category]     = Field(default_factory=list)
-    products:     List[ProductShade] = Field(min_length=1)
-    top_n:        int                = Field(default=3, ge=1, le=20)
+    # Flat fields
+    user_id:        Optional[str]               = None
+    user_profile:   Optional[SkinAnalysisResult]= None
+    categories:     List[Category]              = Field(default_factory=list)
+    products:       Optional[List[ProductShade]]= None
+    total_products: Optional[int]               = None
+    page:           Optional[int]               = None
+    total_pages:    Optional[int]               = None
+    next:           Optional[str]               = None
+    previous:       Optional[str]               = None
 
-    # Pagination fields — accepted so validation never fails, not used by AI
-    total_products: Optional[int] = None
-    page:           Optional[int] = None
-    total_pages:    Optional[int] = None
-    next:           Optional[str] = None
-    previous:       Optional[str] = None
+    top_n: int = Field(default=3, ge=1, le=20)
+
+    def get_explore_data(self) -> ExploreData:
+        if self.data is not None:
+            return self.data
+        if self.user_profile is not None and self.products is not None:
+            return ExploreData(
+                user_id=self.user_id,
+                user_profile=self.user_profile,
+                categories=self.categories,
+                products=self.products,
+                total_products=self.total_products,
+                page=self.page,
+                total_pages=self.total_pages,
+                next=self.next,
+                previous=self.previous,
+            )
+        raise ValueError(
+            "Request must include either a 'data' object or flat "
+            "'user_profile' + 'products' fields."
+        )
 
     def products_with_category(self) -> List[ProductShade]:
         """
-        Return the product list with `category` resolved from the
-        categories array.
+        Resolve category name onto each product from the categories array.
 
-        Matching strategy (first match wins):
-          1. Category name is a substring of product name (case-insensitive).
-          2. Falls back to the first category in the list.
-          3. Falls back to None if categories list is empty.
+        Matching order (first match wins):
+          1. Category slug is a substring of the product slug.
+          2. Category name is a substring of the product name.
+          3. Falls back to the first category in the list.
         """
-        if not self.categories:
-            return self.products
+        explore    = self.get_explore_data()
+        products   = explore.products
+        categories = explore.categories
 
-        fallback = self.categories[0].name
+        if not categories:
+            return products
+
+        fallback = categories[0].name
         enriched: List[ProductShade] = []
 
-        for product in self.products:
+        for product in products:
             if product.category:
                 enriched.append(product)
                 continue
 
             resolved = fallback
-            name_lower = product.name.lower()
-            for cat in self.categories:
-                if cat.name.lower() in name_lower:
-                    resolved = cat.name
-                    break
+
+            if product.slug:
+                slug_lower = product.slug.lower()
+                for cat in categories:
+                    if cat.slug.lower() in slug_lower:
+                        resolved = cat.name
+                        break
+                else:
+                    name_lower = product.name.lower()
+                    for cat in categories:
+                        if cat.name.lower() in name_lower:
+                            resolved = cat.name
+                            break
+            else:
+                name_lower = product.name.lower()
+                for cat in categories:
+                    if cat.name.lower() in name_lower:
+                        resolved = cat.name
+                        break
 
             enriched.append(product.model_copy(update={"category": resolved}))
 
@@ -210,21 +281,23 @@ class RecommendationRequest(BaseModel):
 
 class MatchResult(BaseModel):
     """A single ranked recommendation entry."""
-
     best_match_id:   str
     match_score:     int = Field(ge=0, le=100)
     reasoning:       str
-    matched_product: Optional[ProductShade] = Field(
-        default=None,
-        description="Full product details for the matched item.",
-    )
+    matched_product: Optional[MatchedProduct] = None
 
 
 class RecommendationResponse(BaseModel):
-    """Response schema for the /recommend endpoint."""
+    """
+    Response schema for the /recommend endpoint.
 
+    categories  — the original category list passed through unchanged.
+    recommendations — ranked product matches (no category inside each product).
+    total       — number of recommendations returned.
+    """
+    categories:      List[Category]
     recommendations: List[MatchResult]
-    total:           int = Field(description="Number of recommendations returned.")
+    total:           int
 
 
 # ─────────────────────────────────────────────
