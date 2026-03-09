@@ -1,16 +1,23 @@
-from fastapi import APIRouter, Depends, File, UploadFile, status, Body
-from sqlmodel import Session
-from app.database import get_session
-from app.core.security import verify_api_key  # <--- Import this
-from app.services.ai_service import analyze_face_image, get_shade_recommendation
-from app.schemas import UserProfileResponse, MatchResult, RecommendationRequest, SkinAnalysisResult
+from fastapi import APIRouter, Depends, File, UploadFile
 
-# Lock down the entire router
-router = APIRouter(tags=["Internal AI Service"], dependencies=[Depends(verify_api_key)])
+from app.core.security import verify_api_key
+from app.services.ai_service import analyze_face_image, get_shade_recommendations
+from app.schemas import (
+    RecommendationRequest,
+    RecommendationResponse,
+    SkinAnalysisResult,
+)
+
+# Every route in this router requires a valid X-API-KEY header
+router = APIRouter(
+    tags=["Internal AI Service"],
+    dependencies=[Depends(verify_api_key)],
+)
+
 
 @router.post(
     "/analyze",
-    response_model=SkinAnalysisResult, # Return pure analysis data
+    response_model=SkinAnalysisResult,
     summary="Server-to-Server Face Analysis",
 )
 async def analyze_skin(
@@ -18,29 +25,79 @@ async def analyze_skin(
 ):
     """
     Receives an image file from the Main Backend.
-    Returns the raw analysis JSON (Skin Tone, Undertone, etc.).
+    Returns the raw skin analysis JSON (Skin Tone, Undertone, Face Shape, etc.).
+    The Main Backend decides whether to persist the result.
     """
     image_bytes = await image.read()
-    
-    # AI Service analyzes the image
-    ai_result = await analyze_face_image(image_bytes)
-    
-    # We return the dictionary directly. 
-    # The Main Backend will decide whether to save this to their DB.
-    return ai_result
+    return await analyze_face_image(image_bytes)
 
 
 @router.post(
     "/recommend",
-    response_model=MatchResult,
-    summary="Server-to-Server Recommendation",
+    response_model=RecommendationResponse,
+    summary="Server-to-Server Shade Recommendations",
 )
-async def recommend_product(
+async def recommend_products(
     request: RecommendationRequest,
 ):
     """
-    Receives a User Profile + Product List from Main Backend.
-    Returns the best match.
+    Accepts the EXACT explore-page payload from the Main Backend and
+    returns a ranked list of the best-matching product shades.
+
+    The `categories` array is joined with the `products` array here so
+    the AI receives a fully enriched product list (with category names).
+
+    Request body shape
+    ──────────────────
+    {
+      "user_id":      "test_user_123",
+      "top_n":        3,
+      "user_profile": {
+        "skin_tone":        "Deep",
+        "undertone":        "Warm",
+        "face_shape":       "Oval",
+        "eye_color":        "Brown",
+        "confidence_score": 98,
+        "summary":          "Deep skin with warm undertones."
+      },
+      "categories": [
+        { "id": 1, "name": "Lipstick", "slug": "lipstick", ... },
+        { "id": 2, "name": "Cream",    "slug": "cream",    ... }
+      ],
+      "products": [
+        {
+          "id":                  16,
+          "name":                "Velvet Matte Lipstick",
+          "brand":               "VELYVA",
+          "shade":               "Crystal Pink",
+          "price":               "399.00",
+          "discount_percentage": 0,
+          "rating":              "0.0",
+          "image":               "http://..."
+        },
+        ...
+      ]
+    }
+
+    Response shape
+    ──────────────
+    {
+      "recommendations": [
+        {
+          "best_match_id":   "3",
+          "match_score":     94,
+          "reasoning":       "Peachy Blush ...",
+          "matched_product": { ... }
+        }
+      ],
+      "total": 3
+    }
     """
-    result = await get_shade_recommendation(request.user_profile, request.products)
-    return result
+    # Resolve category names onto each product before sending to AI
+    enriched_products = request.products_with_category()
+
+    return await get_shade_recommendations(
+        profile=request.user_profile,
+        products=enriched_products,
+        top_n=request.top_n,
+    )
