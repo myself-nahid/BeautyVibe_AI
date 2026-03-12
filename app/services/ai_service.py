@@ -103,13 +103,61 @@ def _build_product_payload(products: list[ProductShade]) -> list[dict]:
 # Face analysis
 # ─────────────────────────────────────────────
 
+async def _check_image_contains_face(data_url: str) -> bool:
+    """
+    Quick pre-check: returns True only if the image contains a human face/selfie.
+    Returns False for hands, objects, or any non-face content.
+    """
+    try:
+        response = await _client.chat.completions.create(
+            model=settings.OPENAI_MODEL,
+            messages=[
+                {"role": "system", "content": "You are an image classifier. Output JSON only."},
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "Does this image contain a human face (selfie/portrait)? "
+                                "Return ONLY this JSON:\n"
+                                '{"contains_face": true/false, "detected_content": "<what you see>"}'
+                            ),
+                        },
+                        {"type": "image_url", "image_url": {"url": data_url}},
+                    ],
+                },
+            ],
+            response_format={"type": "json_object"},
+            max_tokens=60,
+            temperature=0,
+        )
+        result = json.loads(response.choices[0].message.content)
+        return bool(result.get("contains_face", False))
+    except (OpenAIError, json.JSONDecodeError):
+        return True  # fail open — let the main analysis handle it
+
+
 async def analyze_face_image(image_bytes: bytes) -> dict[str, Any]:
     """
     Analyse a face image using GPT-4o vision.
-    Never raises — returns _FALLBACK_ANALYSIS on any error.
+    Returns a sentinel dict (confidence_score=-1) if no face is detected.
+    Never raises — returns _FALLBACK_ANALYSIS on any other error.
     """
     mime     = _validate_image(image_bytes)
     data_url = _MIME_TO_PREFIX[mime] + base64.b64encode(image_bytes).decode()
+
+    # ── Face gate ──────────────────────────────────────────────────────────
+    if not await _check_image_contains_face(data_url):
+        logger.warning("analyze_face_image: no face detected in uploaded image.")
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                "No face detected. Please upload a clear selfie or portrait photo "
+                "so we can analyse your skin tone and features."
+            ),
+        )
+    # ───────────────────────────────────────────────────────────────────────
 
     prompt = (
         "You are a professional beauty consultant with expertise in skin analysis.\n\n"

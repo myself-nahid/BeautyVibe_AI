@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from fastapi.responses import JSONResponse
 
 from app.core.security import verify_api_key
 from app.services.ai_service import analyze_face_image, get_shade_recommendations
@@ -27,7 +28,17 @@ async def analyze_skin(
     Returns the raw skin analysis JSON.
     """
     image_bytes = await image.read()
-    return await analyze_face_image(image_bytes)
+    try:
+        return await analyze_face_image(image_bytes)
+    except HTTPException as exc:
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={
+                "success": False,
+                "code":    exc.status_code,
+                "message": exc.detail,
+            },
+        )
 
 
 @router.post(
